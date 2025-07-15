@@ -2,4 +2,5 @@
   name: Check model changes require migration
   entry: ./check_migration_timestamp.sh
   language: script
+  pass_filenames: false
   description: Fails if model/entity code changed but no newer Alembic migration exists
