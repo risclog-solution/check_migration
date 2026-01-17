@@ -4,15 +4,13 @@ set -euo pipefail
 MODEL_DIRS=""
 MIGRATION_DIR=""
 EXCLUDES=()
-EXCLUDE_DIRS=()
-
 
 for arg in "$@"; do
     case $arg in
         --model-dirs=*) MODEL_DIRS="${arg#*=}" ;;
         --migration-dir=*) MIGRATION_DIR="${arg#*=}" ;;
         --exclude=*) IFS=',' read -ra EXC <<< "${arg#*=}"; EXCLUDES+=("${EXC[@]}") ;;
-        --exclude-dir=*) IFS=',' read -ra EXC_DIR <<< "${arg#*=}"; EXCLUDE_DIRS+=("${EXC_DIR[@]}") ;;
+        --exclude-dir=*) ;; # ignored for now, kept for compatibility
         *) ;;  
     esac
 done
@@ -22,47 +20,50 @@ if [[ -z "$MODEL_DIRS" || -z "$MIGRATION_DIR" ]]; then
     exit 1
 fi
 
-IFS=',' read -ra DIRS <<< "$MODEL_DIRS"
-latest_model_change=0
+# Get staged files
+STAGED_FILES=$(git diff --cached --name-only)
 
-FIND_EXCLUDE_ARGS=()
+# Build exclude pattern
+EXCLUDE_PATTERN=""
 for pattern in "${EXCLUDES[@]}"; do
-    FIND_EXCLUDE_ARGS+=(! -name "$pattern")
+    if [ -n "$EXCLUDE_PATTERN" ]; then
+        EXCLUDE_PATTERN="$EXCLUDE_PATTERN|$pattern"
+    else
+        EXCLUDE_PATTERN="$pattern"
+    fi
 done
 
-FIND_PRUNE_ARGS=()
-for d in "${EXCLUDE_DIRS[@]}"; do
-    FIND_PRUNE_ARGS+=( -name "$d" -prune -o )
-done
+# Check for changed model files in staging area
+MODEL_CHANGES=""
+IFS=',' read -ra DIRS <<< "$MODEL_DIRS"
 
-any_file_found=false
 for dir in "${DIRS[@]}"; do
-    if [ -d "$dir" ]; then
-        ts=$(find "$dir" "${FIND_PRUNE_ARGS[@]}" -type f "${FIND_EXCLUDE_ARGS[@]}" \
-            -exec stat -c "%Y" {} + 2>/dev/null | sort -n | tail -n 1 || echo "")
-        if [ -n "$ts" ]; then
-            any_file_found=true
-            if [ "$ts" -gt "$latest_model_change" ]; then
-                latest_model_change=$ts
-            fi
+    dir_changes=$(echo "$STAGED_FILES" | grep "^$dir/" || true)
+    if [ -n "$dir_changes" ]; then
+        if [ -n "$EXCLUDE_PATTERN" ]; then
+            dir_changes=$(echo "$dir_changes" | grep -v -E "$EXCLUDE_PATTERN" || true)
+        fi
+        if [ -n "$dir_changes" ]; then
+            MODEL_CHANGES="$dir_changes"
+            break
         fi
     fi
 done
 
-if [ "$any_file_found" = false ]; then
+# If no model changes, we're good
+if [ -z "$MODEL_CHANGES" ]; then
     exit 0
 fi
 
-if [ -d "$MIGRATION_DIR" ]; then
-    latest_migration_change=$(find "$MIGRATION_DIR" -type f -name "*.py" \
-        -exec stat -c "%Y" {} + 2>/dev/null | sort -n | tail -n 1 || echo 0)
-    latest_migration_change="${latest_migration_change:-0}"
-else
-    latest_migration_change=0
-fi
+# Check for migration changes in staging area
+MIGRATION_CHANGES=$(echo "$STAGED_FILES" | grep "^$MIGRATION_DIR/" | grep "\.py$" || true)
 
-if (( latest_model_change > latest_migration_change )); then
-    echo "❌ Detected changes in database/entitities directories without a newer migration in $MIGRATION_DIR"
+if [ -z "$MIGRATION_CHANGES" ]; then
+    echo "❌ Detected changes in $(echo "$MODEL_DIRS" | tr ',' ' + ') without a new migration in $MIGRATION_DIR"
+    echo ""
+    echo "Changed model files:"
+    echo "$MODEL_CHANGES"
+    echo ""
     echo "→ Please create a migration using: alembic revision --autogenerate -m '...'"
     exit 1
 fi
